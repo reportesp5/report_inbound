@@ -8,24 +8,38 @@ import time
 import os
 import json
 import base64
+import traceback
+
+def log(msg):
+    """Função auxiliar para padronizar os logs com horário."""
+    agora = datetime.now().strftime('%H:%M:%S')
+    print(f"[{agora}] {msg}")
 
 # --- Configurações e Autenticação ---
 def autenticar_e_criar_cliente():
+    log("Iniciando autenticação no Google Cloud...")
     creds_raw = os.environ.get('GCP_SA_KEY_JSON', '').strip()
     if not creds_raw:
+        log("❌ ERRO: Variável 'GCP_SA_KEY_JSON' não encontrada ou vazia.")
         return None
     try:
         creds_json_str = base64.b64decode(creds_raw, validate=True).decode('utf-8')
     except:
         creds_json_str = creds_raw
     try:
-        return gspread.service_account_from_dict(json.loads(creds_json_str), scopes=['https://www.googleapis.com/auth/spreadsheets'])
-    except:
+        cliente = gspread.service_account_from_dict(json.loads(creds_json_str), scopes=['https://www.googleapis.com/auth/spreadsheets'])
+        log("✅ Autenticação realizada com sucesso!")
+        return cliente
+    except Exception as e:
+        log(f"❌ ERRO CRÍTICO na autenticação: {e}")
         return None
 
 def enviar_webhook(mensagem_txt):
+    log("Preparando envio de payload para o Webhook do SeaTalk...")
     webhook_url = os.environ.get('SEATALK_WEBHOOK_URL') 
+    
     if not webhook_url:
+        log("❌ ERRO WEBHOOK: A URL do webhook não foi encontrada na variável 'SEATALK_WEBHOOK_URL'.")
         return False
     
     try:
@@ -33,15 +47,32 @@ def enviar_webhook(mensagem_txt):
             "tag": "text",
             "text": { "format": 1, "content": f"```\n{mensagem_txt}\n```" }
         }
-        response = requests.post(webhook_url, json=payload)
-        return response.status_code == 200
+        
+        t0 = time.time()
+        response = requests.post(webhook_url, json=payload, timeout=15) # Adicionado timeout para evitar travamento infinito
+        t1 = time.time()
+        
+        log(f"Resposta do Webhook recebida em {round(t1-t0, 2)} segundos.")
+        
+        if response.status_code == 200:
+            log("✅ Mensagem entregue no SeaTalk com sucesso!")
+            return True
+        else:
+            log(f"❌ ERRO WEBHOOK: Falha ao enviar. Status Code: {response.status_code}")
+            log(f"Detalhe do erro reportado pela API: {response.text}")
+            return False
+            
+    except requests.exceptions.Timeout:
+        log("❌ ERRO WEBHOOK: Timeout. O SeaTalk demorou mais de 15 segundos para responder.")
+        return False
     except Exception as e:
-        print(f"Erro na requisição: {e}")
+        log(f"❌ ERRO WEBHOOK (Exceção de código): {e}")
+        log(traceback.format_exc())
         return False
 
 # --- Funções de Apoio ---
 def minutos_para_hhmm(minutos):
-    if minutos == -999: # Código especial para 00:00
+    if minutos == -999:
         return "00:00"
     sinal = "-" if minutos < 0 else ""
     m = abs(minutos)
@@ -51,48 +82,73 @@ def padronizar_doca(doca_str):
     match = re.search(r'(\d+)$', str(doca_str))
     return match.group(1) if match else "--"
 
-def ler_aba_com_retry(planilha, nome_aba, range_celulas):
+def ler_aba_otimizada(planilha, nome_aba):
+    """Lê a aba inteira mas filtra linhas onde a Coluna A está vazia."""
+    log(f"⏳ Solicitando dados da aba '{nome_aba}' para a API do Google...")
     for tentativa in range(3):
         try:
-            dados = planilha.worksheet(nome_aba).get(range_celulas)
-            if len(dados) > 1:
-                return dados
-            else:
-                print(f"⚠️ Aba '{nome_aba}' parece vazia ou atualizando. (Tentativa {tentativa+1}/3)")
-                time.sleep(3)
-                if tentativa == 2:
-                    return dados
+            t0 = time.time()
+            # get_all_values puxa apenas o range que realmente contém dados, evitando 413 (Response too large)
+            dados_brutos = planilha.worksheet(nome_aba).get_all_values()
+            t1 = time.time()
+            
+            if not dados_brutos or len(dados_brutos) <= 1:
+                log(f"⚠️ Aba '{nome_aba}' está vazia ou contém apenas o cabeçalho. Tempo: {round(t1-t0, 2)}s.")
+                return []
+            
+            cabecalho = dados_brutos[0]
+            
+            # FILTRO: Mantém apenas linhas onde a primeira coluna (index 0) não é vazia
+            linhas_validas = [linha for linha in dados_brutos[1:] if len(linha) > 0 and str(linha[0]).strip() != ""]
+            
+            if not linhas_validas:
+                log(f"⚠️ Aba '{nome_aba}' ignorada: Nenhuma linha possui dado na Coluna A. Tempo: {round(t1-t0, 2)}s.")
+                return []
+
+            log(f"✅ Aba '{nome_aba}' lida e filtrada! {len(linhas_validas)} linhas úteis encontradas. Tempo de rede: {round(t1-t0, 2)}s.")
+            return [cabecalho] + linhas_validas
+            
         except Exception as e:
-            print(f"❌ Erro ao ler '{nome_aba}': {e}")
+            log(f"❌ Erro ao ler '{nome_aba}' (Tentativa {tentativa+1}/3): {e}")
             time.sleep(3)
+    
+    log(f"❌ Falha definitiva ao ler a aba '{nome_aba}' após 3 tentativas.")
     return []
 
 # --- Lógica Principal ---
 def main():
-    print(f"🔄 Iniciando processamento de dados (Execução única)...")
+    log("🚀 INICIANDO SCRIPT DE RELATÓRIO OPERACIONAL")
     agora_br = datetime.utcnow() - timedelta(hours=3) # Ajuste fuso Brasília
+    log(f"Data/Hora Base Operacional: {agora_br.strftime('%d/%m/%Y %H:%M:%S')}")
     
     cliente = autenticar_e_criar_cliente()
     if not cliente: 
-        print("❌ FALHA CRÍTICA: Autenticação.")
         return
 
     SPREADSHEET_ID = '1TfzqJZFD3yPNCAXAiLyEw876qjOlitae0pP9TTqNCPI'
     
     try:
+        log("Tentando abrir a planilha principal...")
         planilha = cliente.open_by_key(SPREADSHEET_ID)
-    except:
-        print("❌ Não foi possível abrir a planilha.")
+        log(f"✅ Planilha '{planilha.title}' aberta com sucesso.")
+    except Exception as e:
+        log(f"❌ Não foi possível abrir a planilha. Verifique o ID ou permissões.")
+        log(traceback.format_exc())
         return
 
     em_descarregando, em_doca, em_fila, em_chegada = [], [], [], []
     lts_processados_no_report = set()
 
     # --- PARTE 1: Processar o PÁTIO (Aba 'Report') ---
-    raw_report = ler_aba_com_retry(planilha, 'Report', 'A1:L8000')
+    log("--- INICIANDO PROCESSAMENTO: ABA REPORT ---")
+    raw_report = ler_aba_otimizada(planilha, 'Report')
     if raw_report:
+        log("Montando DataFrame do Pandas para 'Report'...")
         colunas = [str(h).strip() for h in raw_report[0]]
-        df_rep = pd.DataFrame(raw_report[1:], columns=colunas)
+        dados_corrigidos = [row + [None] * (len(colunas) - len(row)) for row in raw_report[1:]]
+        df_rep = pd.DataFrame(dados_corrigidos, columns=colunas)
+        
+        log(f"DataFrame 'Report' montado. Formato: {df_rep.shape[0]} linhas x {df_rep.shape[1]} colunas.")
         
         C_TRIP    = 'LH Trip Nnumber' 
         C_ETA     = 'ETA Planejado'
@@ -103,53 +159,60 @@ def main():
         C_DOCA    = 'Doca'
         C_TO      = 'TO'
 
+        log("Convertendo campos de data na aba 'Report'...")
         for col in [C_CHECKIN, C_ENTRADA, C_ETA]:
             if col in df_rep.columns:
                 df_rep[col] = pd.to_datetime(df_rep[col], dayfirst=True, errors='coerce')
 
-        for _, row in df_rep.iterrows():
-            status = str(row.get(C_STATUS, '')).strip().lower()
-            termos_interesse = ['descarregando', 'doca', 'fila']
-            
-            if any(s in status for s in termos_interesse) and 'finalizado' not in status:
-                lt_atual = str(row.get(C_TRIP, '???')).strip()
-                if lt_atual and lt_atual != '???':
-                    lts_processados_no_report.add(lt_atual)
+        log("Iterando sobre as linhas do 'Report'...")
+        for index, row in df_rep.iterrows():
+            try:
+                status = str(row.get(C_STATUS, '')).strip().lower()
+                termos_interesse = ['descarregando', 'doca', 'fila']
+                
+                if any(s in status for s in termos_interesse) and 'finalizado' not in status:
+                    lt_atual = str(row.get(C_TRIP, '???')).strip()
+                    if lt_atual and lt_atual != '???':
+                        lts_processados_no_report.add(lt_atual)
 
-                data_ref = row[C_CHECKIN] if pd.notna(row.get(C_CHECKIN)) else row.get(C_ENTRADA)
-                doca = padronizar_doca(row.get(C_DOCA, '--'))
-                val_to = str(row.get(C_TO, '--')).strip()
-                origem = str(row.get(C_ORIGEM, '--')).strip()
-                
-                eta_val = row.get(C_ETA)
-                eta_s = eta_val.strftime('%d/%m %H:%M') if pd.notna(eta_val) else '--/-- --:--'
-                
-                if 'fila' in status:
-                    if pd.isna(row.get(C_CHECKIN)):
-                        minutos = -999
+                    data_ref = row[C_CHECKIN] if pd.notna(row.get(C_CHECKIN)) else row.get(C_ENTRADA)
+                    doca = padronizar_doca(row.get(C_DOCA, '--'))
+                    val_to = str(row.get(C_TO, '--')).strip()
+                    origem = str(row.get(C_ORIGEM, '--')).strip()
+                    
+                    eta_val = row.get(C_ETA)
+                    eta_s = eta_val.strftime('%d/%m %H:%M') if pd.notna(eta_val) else '--/-- --:--'
+                    
+                    if 'fila' in status:
+                        if pd.isna(row.get(C_CHECKIN)):
+                            minutos = -999
+                        else:
+                            minutos = int((agora_br - row[C_CHECKIN]).total_seconds() / 60)
                     else:
-                        minutos = int((agora_br - row[C_CHECKIN]).total_seconds() / 60)
-                else:
-                    if pd.notna(data_ref):
-                        minutos = int((agora_br - data_ref).total_seconds() / 60)
-                    else:
-                        minutos = 0 
+                        if pd.notna(data_ref):
+                            minutos = int((agora_br - data_ref).total_seconds() / 60)
+                        else:
+                            minutos = 0 
 
-                tempo = minutos_para_hhmm(minutos)
-                linha = f"{lt_atual:^13} | {doca:^4} | {val_to:^7} | {eta_s:^11} | {tempo:^6} | {origem:^10}"
-                
-                if 'descarregando' in status:
-                    em_descarregando.append((minutos, linha))
-                elif 'doca' in status:
-                    em_doca.append((minutos, linha))
-                elif 'fila' in status:
-                    em_fila.append((minutos, linha))
+                    tempo = minutos_para_hhmm(minutos)
+                    linha = f"{lt_atual:^13} | {doca:^4} | {val_to:^7} | {eta_s:^11} | {tempo:^6} | {origem:^10}"
+                    
+                    if 'descarregando' in status: em_descarregando.append((minutos, linha))
+                    elif 'doca' in status: em_doca.append((minutos, linha))
+                    elif 'fila' in status: em_fila.append((minutos, linha))
+            except Exception as e_row:
+                log(f"⚠️ Erro ao processar a linha {index} da aba Report: {e_row}")
+        
+        log(f"Fim do processamento 'Report'. LTs encontrados: {len(em_descarregando)} descarregando, {len(em_doca)} doca, {len(em_fila)} fila.")
 
     # --- PARTE 2: Processar 'Deu chegada' ---
-    raw_chegada_manual = ler_aba_com_retry(planilha, 'Deu chegada', 'A1:F1000')
+    log("--- INICIANDO PROCESSAMENTO: ABA DEU CHEGADA ---")
+    raw_chegada_manual = ler_aba_otimizada(planilha, 'Deu chegada')
     if raw_chegada_manual:
+        log("Montando DataFrame 'Deu Chegada'...")
         cols_manual = [str(h).strip() for h in raw_chegada_manual[0]]
-        df_manual = pd.DataFrame(raw_chegada_manual[1:], columns=cols_manual)
+        dados_corrigidos_manual = [row + [None] * (len(cols_manual) - len(row)) for row in raw_chegada_manual[1:]]
+        df_manual = pd.DataFrame(dados_corrigidos_manual, columns=cols_manual)
         
         col_lt_m = next((c for c in df_manual.columns if c.upper() == 'LT'), 'LT')
         col_origem_m = next((c for c in df_manual.columns if 'code' in c.lower()), 'code')
@@ -162,7 +225,8 @@ def main():
         if col_eta_m in df_manual.columns:
             df_manual[col_eta_m] = pd.to_datetime(df_manual[col_eta_m], dayfirst=True, errors='coerce')
 
-        for _, row in df_manual.iterrows():
+        log("Avaliando os LTs que já deram chegada...")
+        for index, row in df_manual.iterrows():
             lt_val = str(row.get(col_lt_m, '')).strip()
             time_val = row.get(col_chegada_m)
             
@@ -177,13 +241,15 @@ def main():
                     tempo = minutos_para_hhmm(minutos)
                     linha = f"{lt_val:^13} | {doca:^4} | {val_to:^7} | {eta_s:^11} | {tempo:^6} | {origem:^10}"
                     em_chegada.append((minutos, linha))
+        
+        log(f"Fim do processamento 'Deu Chegada'. {len(em_chegada)} LTs pendentes a cobrar.")
 
     # --- PARTE 3: Processar o RESUMO (Aba 'Pendente') ---
-    # AJUSTE: Mudei o nome da aba e o range de colunas para garantir que ele leia tudo, até onde o Cutoff estiver
-    raw_pendente = ler_aba_com_retry(planilha, 'Pendente', 'A1:AC8000') 
+    log("--- INICIANDO PROCESSAMENTO: ABA PENDENTE ---")
+    raw_pendente = ler_aba_otimizada(planilha, 'Pendente') 
     resumo = {'atrasado': {}, 'hoje': {}, 'amanha': {}}
     
-    # Define a data operacional baseada no corte de 06:00
+    # Corte Operacional 06:00
     if agora_br.time() < dt_time(6, 0):
         op_date_hoje = agora_br.date() - timedelta(days=1)
     else:
@@ -197,20 +263,23 @@ def main():
     mapa_turnos = {'T1': 1, 'T2': 2, 'T3': 3}
 
     if raw_pendente:
+        log("Montando DataFrame 'Pendente'...")
         colunas_pen = [str(h).strip() for h in raw_pendente[0]]
-        df_pen = pd.DataFrame(raw_pendente[1:], columns=colunas_pen)
+        dados_corrigidos_pen = [row + [None] * (len(colunas_pen) - len(row)) for row in raw_pendente[1:]]
+        df_pen = pd.DataFrame(dados_corrigidos_pen, columns=colunas_pen)
         
         col_saida = next((c for c in df_pen.columns if 'descarregado' in c.lower()), None)
         col_pacotes = next((c for c in df_pen.columns if 'acote' in c.lower()), 'Pacotes')
         col_to = next((c for c in df_pen.columns if c.upper() == 'TO'), 'TO')
-        # Tenta buscar por 'cutoff', se não achar, busca por 'data'
         col_data = next((c for c in df_pen.columns if 'cutoff' in c.lower() or 'data' in c.lower() and 'descarregado' not in c.lower()), 'Data')
         
+        log("Ajustando tipos numéricos e de data em 'Pendente'...")
         df_pen[col_pacotes] = pd.to_numeric(df_pen[col_pacotes], errors='coerce').fillna(0).astype(int)
         df_pen[col_to] = pd.to_numeric(df_pen[col_to], errors='coerce').fillna(0).astype(int)
         df_pen[col_data] = pd.to_datetime(df_pen[col_data], dayfirst=True, errors='coerce')
         
-        for _, row in df_pen.iterrows():
+        log("Calculando sumarização por turno...")
+        for index, row in df_pen.iterrows():
             if pd.isna(row[col_data]): continue 
             
             if col_saida:
@@ -221,20 +290,15 @@ def main():
             pct = row[col_pacotes]
             val_to_row = row[col_to]
             
-            # --- O GRANDE AJUSTE ESTÁ AQUI ---
-            # Subtraímos 6 horas do timestamp para que as viagens de madrugada 
-            # (até as 05:59) recaiam no dia operacional em que o turno começou.
             data_viagem = row[col_data]
-            d_alvo = (data_viagem - timedelta(hours=6)).date()
+            d_alvo = (data_viagem - timedelta(hours=6)).date() # Subtração para corte das 06h
             
             categoria = None
-            if d_alvo < op_date_hoje: 
-                categoria = 'atrasado'
+            if d_alvo < op_date_hoje: categoria = 'atrasado'
             elif d_alvo == op_date_hoje:
                 eh_turno_passado = mapa_turnos.get(t, 99) < mapa_turnos.get(turno_atual_str, 0)
                 categoria = 'atrasado' if eh_turno_passado else 'hoje'
-            elif d_alvo == op_date_amanha: 
-                categoria = 'amanha'
+            elif d_alvo == op_date_amanha: categoria = 'amanha'
             
             if categoria == 'atrasado' and pct == 0: categoria = None
             
@@ -243,8 +307,10 @@ def main():
                 resumo[categoria][t]['lts'] += 1
                 resumo[categoria][t]['pacotes'] += pct
                 resumo[categoria][t]['tos'] += val_to_row
+        log("Resumo operacional calculado com sucesso.")
 
     # --- MONTAGEM E ENVIO ---
+    log("--- INICIANDO CONSTRUÇÃO DA MENSAGEM FINAL ---")
     for lista in [em_descarregando, em_doca, em_fila, em_chegada]:
         lista.sort(key=lambda x: x[0], reverse=True)
     
@@ -277,17 +343,21 @@ def main():
         bloco_resumo.append("") 
 
     txt_completo = "\n".join(bloco_patio) + "\n" + ("-" * 72) + "\n\n" + "\n".join(bloco_resumo)
+    log(f"Tamanho da mensagem final montada: {len(txt_completo)} caracteres.")
     
-    print("📤 Enviando...")
+    log("Disparando envio principal para o Webhook...")
     if not enviar_webhook(txt_completo):
+        log("⚠️ Envio completo falhou. Tentando quebrar a mensagem em blocos menores (Pátio e depois Resumo)...")
         enviar_webhook("\n".join(bloco_patio))
         time.sleep(1)
-        if bloco_resumo: enviar_webhook("\n".join(bloco_resumo))
-    else:
-        print("✅ Sucesso!")
+        if bloco_resumo: 
+            enviar_webhook("\n".join(bloco_resumo))
+    
+    log("🏁 SCRIPT FINALIZADO.")
 
 if __name__ == '__main__':
     try:
         main()
     except Exception as e:
-        print(f"❌ Erro inesperado: {e}")
+        log("❌ ERRO FATAL NÃO TRATADO NO SCRIPT:")
+        log(traceback.format_exc())
